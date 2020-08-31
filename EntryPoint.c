@@ -1,62 +1,164 @@
 #include "crawler.h"
-#include <signal.h>
+#include "Downloader.h"
 
-struct MemoryStruct {
-    char *memory;
-    size_t size;
-    size_t reserved;
-    CURL *c;
-};
+#include <string.h>
+#include <signal.h>
+#include <pthread.h>
 
 int max_con = 200;
 int max_total = 20000;
 int max_requests = 500;
 int follow_relative_links = 1;
-char *start_page = "http://www.ikanwxz.top/book/20";
+const char *start_page = "http://www.ikanwxz.top/book/20";
 int pending_interrupt = 0;
+
+int max_threads = 5;
+int global = 0;
+
+pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static char* findUrlFileId(char* s)
+{
+  char* ret = strrchr(s, '/');
+  if (ret)
+  {
+    return ret + 1;
+  }
+  return NULL;
+}
+
+static void downloadFile(links* l)
+{
+  if (l == NULL)
+  {
+    return;
+  }
+  struct transfer trans[1];
+  CURLM *multi_handle;
+  int i;
+  int still_running = 0;
+
+  multi_handle = curl_multi_init();
+ 
+  for(i = 0; i < l->rows; i++) {
+    char* url = l->arr[i];
+    setup(&trans[i], url, findUrlFileId(url));
+ 
+    /* add the individual transfer */ 
+    curl_multi_add_handle(multi_handle, trans[i].easy);
+  }
+
+  curl_multi_setopt(multi_handle, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+
+  curl_multi_perform(multi_handle, &still_running);
+
+  while(still_running) {
+    struct timeval timeout;
+    int rc; /* select() return code */ 
+    CURLMcode mc; /* curl_multi_fdset() return code */ 
+ 
+    fd_set fdread;
+    fd_set fdwrite;
+    fd_set fdexcep;
+    int maxfd = -1;
+ 
+    long curl_timeo = -1;
+ 
+    FD_ZERO(&fdread);
+    FD_ZERO(&fdwrite);
+    FD_ZERO(&fdexcep);
+ 
+    /* set a suitable timeout to play around with */ 
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+ 
+    curl_multi_timeout(multi_handle, &curl_timeo);
+    if(curl_timeo >= 0) {
+      timeout.tv_sec = curl_timeo / 1000;
+      if(timeout.tv_sec > 1)
+        timeout.tv_sec = 1;
+      else
+        timeout.tv_usec = (curl_timeo % 1000) * 1000;
+    }
+ 
+    /* get file descriptors from the transfers */ 
+    mc = curl_multi_fdset(multi_handle, &fdread, &fdwrite, &fdexcep, &maxfd);
+ 
+    if(mc != CURLM_OK) {
+      fprintf(stderr, "curl_multi_fdset() failed, code %d.\n", mc);
+      break;
+    }
+ 
+    /* On success the value of maxfd is guaranteed to be >= -1. We call
+       select(maxfd + 1, ...); specially in case of (maxfd == -1) there are
+       no fds ready yet so we call select(0, ...) --or Sleep() on Windows--
+       to sleep 100ms, which is the minimum suggested value in the
+       curl_multi_fdset() doc. */ 
+ 
+    if(maxfd == -1) {
+#ifdef _WIN32
+      Sleep(100);
+      rc = 0;
+#else
+      /* Portable sleep for platforms other than Windows. */ 
+      struct timeval wait = { 0, 100 * 1000 }; /* 100ms */ 
+      rc = select(0, NULL, NULL, NULL, &wait);
+#endif
+    }
+    else {
+      /* Note that on some platforms 'timeout' may be modified by select().
+         If you need access to the original value save a copy beforehand. */ 
+      rc = select(maxfd + 1, &fdread, &fdwrite, &fdexcep, &timeout);
+    }
+ 
+    switch(rc) {
+    case -1:
+      /* select error */ 
+      break;
+    case 0:
+    default:
+      /* timeout or readable/writable sockets */ 
+      curl_multi_perform(multi_handle, &still_running);
+      break;
+    }
+  }
+ 
+  for(i = 0; i < l->rows; i++) {
+    curl_multi_remove_handle(multi_handle, trans[i].easy);
+    curl_easy_cleanup(trans[i].easy);
+  }
+ 
+  curl_multi_cleanup(multi_handle);
+
+}
+
 static void sighandler(int dummy)
 {
   pending_interrupt = 1;
 }
 
-
-static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
+static void* pthread_work(void* l)
 {
-    size_t realsize = size * nmemb;
-    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+  if (l == NULL)
+  {
+    return NULL;
+  }
+  links* arg = (links*)l;
+  while (global < arg->rows)
+  {
+    pthread_mutex_lock(&count_mutex);
+    char* link = arg->arr[global++];
+    pthread_mutex_unlock(&count_mutex);
+    CURLM *handle = curl_easy_init();
+    links* jpgLinks = parseHTMLWithUrl(handle, link, (char*)"//div//img/@data-original", (char*)"^http.*jpg$", 0);
+    downloadFile(jpgLinks);
+    free(jpgLinks->arr);
+    free(jpgLinks);
+    curl_easy_cleanup(handle);
 
-    if (mem->reserved == 0)
-    {
-        CURLcode res;
-        double filesize = 0.0;
-
-        res = curl_easy_getinfo(mem->c, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &filesize);
-        if((CURLE_OK == res) && (filesize>0.0))
-        {
-            mem->memory = realloc(mem->memory, (int)filesize + 2);
-            if (mem->memory == NULL) {
-                printf("not enough memory (realloc returned NULL)\n");
-                return 0;
-            }
-            mem->reserved = (int)filesize + 1;
-        }
-    }
-
-    if ((mem->size + realsize + 1) > mem->reserved)
-    {
-        mem->memory = realloc(mem->memory, mem->size + realsize + 1);
-        mem->reserved = mem->size + realsize + 1;
-        if (mem->memory == NULL) {
-            printf("not enough memory (realloc returned NULL)\n");
-            return 0;
-        }
-    }
-
-    memcpy(&(mem->memory[mem->size]), contents, realsize);
-    mem->size += realsize;
-    mem->memory[mem->size] = 0;
-
-    return realsize;
+  }
+  pthread_exit(NULL);
+  return NULL;
 }
 
 int main(int argc, char const *argv[])
@@ -67,26 +169,31 @@ int main(int argc, char const *argv[])
   curl_global_init(CURL_GLOBAL_DEFAULT);
   CURLM *handle = curl_easy_init();
 
-  struct MemoryStruct chunk;
+  links* l = parseHTMLWithUrl(handle, start_page, (char*)"//li//a/@href", (char*)"^/chapter/.*$", 1);
 
-  chunk.memory = malloc(1);
-  chunk.memory[0] = '\0';
-  chunk.size = 0;
-  chunk.reserved = 0;
-  chunk.c = handle;
-
-  char* sourceCode;
-
-  curl_easy_setopt(handle, CURLOPT_URL, start_page);
-  curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-  curl_easy_setopt(handle, CURLOPT_WRITEDATA, (void *)&chunk);
-
-  int res = curl_easy_perform(handle);
-
-  if (res == CURLE_OK) {
-    sourceCode = strdup(chunk.memory);
-    free(chunk.memory);
+  pthread_t threads[max_threads];
+  int thread_count;
+  for (thread_count = 0; thread_count < max_threads; ++thread_count)
+  {
+    if (pthread_create(&threads[thread_count], NULL, &pthread_work, l) != 0)
+    {
+      printf("Can not create thread #%d\n", thread_count);
+      break;
+    }
   }
+  for (int i = 0; i < thread_count; ++i)
+  {
+    if (pthread_join(threads[i], NULL) != 0)
+      {
+        printf("Can not join thread #%d\n", i);
+      }  
+  }
+  pthread_mutex_destroy(&count_mutex);
+
+  //
+
+  free(l->arr);
+  free(l);
  
   /* enables http/2 if available */ 
 // #ifdef CURLPIPE_MULTIPLEX
@@ -140,6 +247,7 @@ int main(int argc, char const *argv[])
 //     pending--;
 //   }
 //   curl_multi_cleanup(multi_handle);
+  curl_easy_cleanup(handle);
   curl_global_cleanup();
   return 0;
 }

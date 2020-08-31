@@ -3,6 +3,13 @@
 #include <regex.h>
 
 #include "crawler.h"
+
+struct MemoryStruct {
+    char *memory;
+    size_t size;
+    size_t reserved;
+    CURL *c;
+};
  
 static size_t grow_buffer(void *contents, size_t sz, size_t nmemb, void *ctx)
 {
@@ -59,7 +66,7 @@ size_t follow_links(CURLM *multi_handle, memory *mem, char *url, const char* reg
   int reti;
   reti = regcomp(&regex, regularExpression, 0);
   if (reti) {
-    printf(stderr, "Could not compile regex\n");
+    printf("Could not compile regex\n");
     return 0;
   }
   int opts = HTML_PARSE_NOBLANKS | HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING | HTML_PARSE_NONET;
@@ -113,72 +120,113 @@ int is_html(char *ctype)
   return ctype != NULL && strlen(ctype) > 10 && strstr(ctype, "text/html");
 }
 
-// int main(int argc, char const *argv[])
-// {
-//   signal(SIGINT, sighandler);
-//   LIBXML_TEST_VERSION;
-//   curl_global_init(CURL_GLOBAL_DEFAULT);
-//   CURLM *multi_handle = curl_multi_init();
-//   curl_multi_setopt(multi_handle, CURLMOPT_MAX_TOTAL_CONNECTIONS, max_con);
-//   curl_multi_setopt(multi_handle, CURLMOPT_MAX_HOST_CONNECTIONS, 6L);
- 
-//   /* enables http/2 if available */ 
-// #ifdef CURLPIPE_MULTIPLEX
-//   curl_multi_setopt(multi_handle, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
-// #endif
- 
-//   /* sets html start page */ 
-//   curl_multi_add_handle(multi_handle, make_handle(start_page));
- 
-//   int msgs_left;
-//   int pending = 0;
-//   int complete = 0;
-//   int still_running = 1;
-//   while(still_running && !pending_interrupt) {
-//     int numfds;
-//     curl_multi_wait(multi_handle, NULL, 0, 1000, &numfds);
-//     curl_multi_perform(multi_handle, &still_running);
- 
-//     /* See how the transfers went */ 
-//     CURLMsg *m = NULL;
-//     while((m = curl_multi_info_read(multi_handle, &msgs_left))) {
-//       if(m->msg == CURLMSG_DONE) {
-//         CURL *handle = m->easy_handle;
-//         char *url;
-//         memory *mem;
-//         curl_easy_getinfo(handle, CURLINFO_PRIVATE, &mem);
-//         curl_easy_getinfo(handle, CURLINFO_EFFECTIVE_URL, &url);
-//         if(m->data.result == CURLE_OK) {
-//           long res_status;
-//           curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &res_status);
-//           if(res_status == 200) {
-//             char *ctype;
-//             curl_easy_getinfo(handle, CURLINFO_CONTENT_TYPE, &ctype);
-//             printf("[%d] HTTP 200 (%s): %s\n", complete, ctype, url);
-//             if(is_html(ctype) && mem->size > 100) {
-//               if(pending < max_requests && (complete + pending) < max_total) {
-//                 pending += follow_links(multi_handle, mem, url);
-//                 still_running = 1;
-//               }
-//             }
-//           }
-//           else {
-//             printf("[%d] HTTP %d: %s\n", complete, (int) res_status, url);
-//           }
-//         }
-//         else {
-//           printf("[%d] Connection failure: %s\n", complete, url);
-//         }
-//         curl_multi_remove_handle(multi_handle, handle);
-//         curl_easy_cleanup(handle);
-//         free(mem->buf);
-//         free(mem);
-//         complete++;
-//         pending--;
-//       }
-//     }
-//   }
-//   curl_multi_cleanup(multi_handle);
-//   curl_global_cleanup();
-//   return 0;
-// }
+static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+    size_t realsize = size * nmemb;
+    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+
+    if (mem->reserved == 0)
+    {
+        CURLcode res;
+        double filesize = 0.0;
+
+        res = curl_easy_getinfo(mem->c, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &filesize);
+        if((CURLE_OK == res) && (filesize>0.0))
+        {
+            mem->memory = realloc(mem->memory, (int)filesize + 2);
+            if (mem->memory == NULL) {
+                printf("not enough memory (realloc returned NULL)\n");
+                return 0;
+            }
+            mem->reserved = (int)filesize + 1;
+        }
+    }
+
+    if ((mem->size + realsize + 1) > mem->reserved)
+    {
+        mem->memory = realloc(mem->memory, mem->size + realsize + 1);
+        mem->reserved = mem->size + realsize + 1;
+        if (mem->memory == NULL) {
+            printf("not enough memory (realloc returned NULL)\n");
+            return 0;
+        }
+    }
+
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+
+    return realsize;
+}
+
+links* parseHTMLWithUrl(CURLM* easy_handle, const char* startPage, const char* nodeXml, const char* regularExpression, int follow_relative_links)
+{
+  struct MemoryStruct chunk;
+
+  chunk.memory = malloc(1);
+  chunk.memory[0] = '\0';
+  chunk.size = 0;
+  chunk.reserved = 0;
+  chunk.c = easy_handle;
+
+  char* sourceCode;
+
+  curl_easy_setopt(easy_handle, CURLOPT_URL, startPage);
+  curl_easy_setopt(easy_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+  curl_easy_setopt(easy_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+
+  int res = curl_easy_perform(easy_handle);
+
+  if (res == CURLE_OK) {
+    sourceCode = strdup(chunk.memory);
+    free(chunk.memory);
+  }
+  regex_t regex;
+  int reti;
+  reti = regcomp(&regex, regularExpression, 0);
+  if (reti) {
+    printf("Could not compile regex\n");
+    return NULL;
+  }
+  int opts = HTML_PARSE_NOBLANKS | HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING | HTML_PARSE_NONET;
+  htmlDocPtr doc = htmlReadMemory(sourceCode, chunk.size, startPage, NULL, opts);
+  if(!doc)
+    return NULL;
+  xmlChar *xpath = (xmlChar*) nodeXml;
+  xmlXPathContextPtr context = xmlXPathNewContext(doc);
+  xmlXPathObjectPtr result = xmlXPathEvalExpression(xpath, context);
+  xmlXPathFreeContext(context);
+  if(!result)
+    return NULL;
+  xmlNodeSetPtr nodeset = result->nodesetval;
+  if(xmlXPathNodeSetIsEmpty(nodeset)) {
+    xmlXPathFreeObject(result);
+    return NULL;
+  }
+
+  links* l = (links*)malloc(sizeof(links));
+  char** array = (char**)malloc((nodeset->nodeNr) * sizeof(char*));
+  int idx = 0;
+  for(int i = 0; i < nodeset->nodeNr; ++i) {
+    const xmlNode *node = nodeset->nodeTab[i]->xmlChildrenNode;
+    xmlChar *href = xmlNodeListGetString(doc, node, 1);
+    reti = regexec(&regex, (char*)href, 0, NULL, 0);
+    if (reti)
+    {
+      continue;
+    }
+    if(follow_relative_links) {
+      xmlChar *orig = href;
+      href = xmlBuildURI(href, (xmlChar *)startPage);
+      xmlFree(orig);
+    }
+    char *link = (char *) href;
+    array[idx] = strdup(link);
+    xmlFree(link);
+    idx++;
+  }
+  l->arr = array;
+  l->rows = idx;
+  regfree(&regex);
+  return l;
+}
