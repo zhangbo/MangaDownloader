@@ -27,18 +27,50 @@ static char* findUrlFileId(char* s)
   return NULL;
 }
 
+static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *fp)
+{
+  return fwrite(ptr, size, nmemb, (FILE *)fp);
+}
+
+static void downloadFile2(links* l)
+{
+  CURL *curl = curl_easy_init();
+  if(curl) {
+    for(int i = 0; i < l->rows; ++i) {
+      char* url = l->arr[i];
+      FILE *fp = fopen(findUrlFileId(url), "wb");
+      if(fp) {
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)fp);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+     
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+     
+        /* do not send TFTP options requests */
+        curl_easy_setopt(curl, CURLOPT_TFTP_NO_OPTIONS, 1L);
+     
+        /* Perform the request */
+        curl_easy_perform(curl);
+     
+        fclose(fp);
+      }
+    }
+  }
+  curl_easy_cleanup(curl);
+}
+
 static void downloadFile(links* l)
 {
   if (l == NULL)
   {
     return;
   }
-  struct transfer trans[1];
+  struct transfer trans[l->rows];
   CURLM *multi_handle;
   int i;
   int still_running = 0;
 
   multi_handle = curl_multi_init();
+  // l->rows = l->rows > 3 ? 3 : l->rows;
  
   for(i = 0; i < l->rows; i++) {
     char* url = l->arr[i];
@@ -151,11 +183,10 @@ static void* pthread_work(void* l)
     pthread_mutex_unlock(&count_mutex);
     CURLM *handle = curl_easy_init();
     links* jpgLinks = parseHTMLWithUrl(handle, link, (char*)"//div//img/@data-original", (char*)"^http.*jpg$", 0);
-    downloadFile(jpgLinks);
+    downloadFile2(jpgLinks);
     free(jpgLinks->arr);
     free(jpgLinks);
     curl_easy_cleanup(handle);
-
   }
   pthread_exit(NULL);
   return NULL;
