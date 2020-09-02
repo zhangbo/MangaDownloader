@@ -9,10 +9,10 @@ int max_con = 200;
 int max_total = 20000;
 int max_requests = 500;
 int follow_relative_links = 1;
-const char *start_page = "http://www.ikanwxz.top/book/20";
+const char *start_page = "https://www.ikanwxz.top/book/419";
 int pending_interrupt = 0;
 
-int max_threads = 5;
+int max_threads = 16;
 int global = 0;
 
 pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -25,6 +25,45 @@ static char* findUrlFileId(char* s)
     return ret + 1;
   }
   return NULL;
+}
+
+static char* replaceStr(char* s, const char* findStr, unsigned int pos, const char* replaceStr)
+{
+  if (s == NULL || pos >= strlen(s) - strlen(findStr) || findStr == NULL)
+  {
+    return NULL;
+  }
+  int i = 0, findout = 1;
+  while (i < strlen(findStr))
+  {
+    if (findStr[i] != s[pos + i])
+    {
+      findout = 0;
+    }
+    i++;
+  }
+
+  if (!findout)
+  {
+    return NULL;
+  }
+  char* newStr = (char*)malloc((strlen(s) + strlen(replaceStr) - strlen(findStr)) * sizeof(char));
+  int afterReplacePos = pos + strlen(findStr), start = 0;
+  for (int j = 0; j < (strlen(s) + strlen(replaceStr) - strlen(findStr)); ++j)
+  {
+    if (j < pos) {
+      newStr[j] = s[j];
+    } else if (j >= pos && j < pos + strlen(replaceStr)) {
+      newStr[j] = replaceStr[j - pos];
+    } else {
+      if (j == pos + strlen(replaceStr))
+      {
+        start = j;
+      }
+      newStr[j] = s[afterReplacePos + j - start];
+    }
+  }
+  return newStr;
 }
 
 static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *fp)
@@ -75,7 +114,7 @@ static void downloadFile(links* l)
   for(i = 0; i < l->rows; i++) {
     char* url = l->arr[i];
     setup(&trans[i], url, findUrlFileId(url));
- 
+    free(url);
     /* add the individual transfer */ 
     curl_multi_add_handle(multi_handle, trans[i].easy);
   }
